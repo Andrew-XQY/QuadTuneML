@@ -9,10 +9,10 @@ input_cols:  # columns of the system input
 target_cols:   # columns for asking the model to predict 
   # - mean_x
   # - mean_y
-  - sigma_x
-  - sigma_y
-  # - emittance_x
-  # - emittance_y
+  # - sigma_x
+  # - sigma_y
+  - emittance_x
+  - emittance_y
   # - transmission
 output_cols:  # columns of the simulation output 
   - mean_x
@@ -32,8 +32,8 @@ longtail_cols:  # columns for remove outliers (thresholding percentile)
   - sigma_x
   - emittance_y
   - transmission
-outlier_threshold: 0.01  # percentile of the data to drop
-segment: 7  # 0-7
+outlier_threshold: 0  # percentile of the data to drop, 0.01 for 1%
+segment: 7 # 0-7
 
 test_size: 0.1
 val_size: 0.1      # fraction of total for validation
