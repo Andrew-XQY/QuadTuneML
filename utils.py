@@ -56,17 +56,6 @@ def log_scale_df(df: pd.DataFrame, cols: list) -> pd.DataFrame:
         df[col] = np.log(df[col])
     return df
 
-def plot_history(history):
-    h = history.history
-    plt.plot(h['loss'],    label='train loss')
-    plt.plot(h['val_loss'], label='val loss')
-    if 'accuracy' in h:
-        plt.plot(h['accuracy'],     label='train acc')
-        plt.plot(h['val_accuracy'], label='val acc')
-    plt.xlabel('Epoch')
-    plt.legend()
-    plt.show()
-
 def add_valid_flag(df: pd.DataFrame, cols: list, pct: float) -> pd.DataFrame:
     """
     Flags rows as valid (1) if all specified columns are within the [pct, 1–pct] quantiles,
@@ -108,6 +97,17 @@ aps_colors = [
     "#999999",  # medium gray
 ]
 
+def plot_history(history):
+    h = history.history
+    plt.plot(h['loss'],    label='train loss')
+    plt.plot(h['val_loss'], label='val loss')
+    if 'accuracy' in h:
+        plt.plot(h['accuracy'],     label='train acc')
+        plt.plot(h['val_accuracy'], label='val acc')
+    plt.xlabel('Epoch')
+    plt.legend()
+    plt.show()
+    
 def process_df(df: pd.DataFrame, inputs, outputs, save_to):
     """
     df       : full DataFrame
