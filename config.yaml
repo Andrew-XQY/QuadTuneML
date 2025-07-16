@@ -1,0 +1,23 @@
+# config.yaml
+input_cols:
+  - klne.zqmd.0208
+  - klne.zqmf.0209
+  - klne.zqmd.0214
+  - klne.zqmf.0215
+target_cols:
+  - mean_x
+  - mean_y
+  - sigma_x
+  - sigma_y
+  - emittance_x
+  - emittance_y
+  - transmission
+test_size: 0.1
+val_size: 0.1      # fraction of total for validation
+batch_size: 32
+learning_rate: 1.0e-5
+epochs: 60
+seed: 42
+patience: 5
+model_path: "model/best_model.keras"
+save_to: "results/"
