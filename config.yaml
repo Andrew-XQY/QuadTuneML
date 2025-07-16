@@ -1,11 +1,20 @@
 # config.yaml
 data_path: "data/batch_results.csv"
-input_cols:
+
+input_cols:  # columns of the system input
   - klne.zqmd.0208
   - klne.zqmf.0209
   - klne.zqmd.0214
   - klne.zqmf.0215
-target_cols:
+target_cols:   # columns for asking the model to predict 
+  # - mean_x
+  # - mean_y
+  - sigma_x
+  - sigma_y
+  # - emittance_x
+  # - emittance_y
+  # - transmission
+output_cols:  # columns of the simulation output 
   - mean_x
   - mean_y
   - sigma_x
@@ -13,6 +22,19 @@ target_cols:
   - emittance_x
   - emittance_y
   - transmission
+log_cols:   # columns to log scale
+  - emittance_x
+  - emittance_y
+  - transmission
+longtail_cols:  # columns for remove outliers (thresholding percentile)
+  - mean_x
+  - mean_y
+  - sigma_x
+  - emittance_y
+  - transmission
+outlier_threshold: 0.01  # percentile of the data to drop
+segment: 7  # 0-7
+
 test_size: 0.1
 val_size: 0.1      # fraction of total for validation
 batch_size: 32
