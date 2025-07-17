@@ -38,8 +38,9 @@ segment: 7 # 0-7
 test_size: 0.1
 val_size: 0.1      # fraction of total for validation
 batch_size: 32
-learning_rate: 1.0e-5
-epochs: 60
+learning_rate: 1.0e-4
+l2: 1.0e-4
+epochs: 100
 seed: 42
 patience: 5
 model_path: "model/best_model.keras"
