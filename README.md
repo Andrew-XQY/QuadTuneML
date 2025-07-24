@@ -1,4 +1,4 @@
-# ELENA Extraction Beamline Simulation
+# ELENA Extraction Beamline ML Toolkit
 
 Python layer above the MAD‑X ELENA extraction beam line simulation, including machine learning training pipelines for fast magnet tuning.
 
