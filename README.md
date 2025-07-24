@@ -1,6 +1,6 @@
 # ELENA Extraction Beamline Simulation
 
-Python layer above the MAD‑X ELENA extraction beam line simulation, including machine learning training pipelines for rapid magnet tuning.
+Python layer above the MAD‑X ELENA extraction beam line simulation, including machine learning training pipelines for fast magnet tuning.
 
 ## Overview
 
