@@ -1,3 +1,15 @@
+import itertools
+import random
+import os
+import glob
+import json
+import time
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from cpymad.madx import Madx
+import pymadx
+
 ###############################################################################
 # CONFIGURATION (all parameters here for easy future config-driven use)
 ###############################################################################
@@ -23,19 +35,21 @@ CONFIG = {
         'alfy': 5.1980977991e-01,
     },
     'output_csv': 'data/batch_results.csv',
-    'flush_every': 100,
+    'flush_every': 10,
 }
+os.makedirs(os.path.join(CONFIG['home_path'], 'data'), exist_ok=True)
 
 ###############################################################################
 # QUEUE CONSTRUCTION (grid scan)
 ###############################################################################
-import itertools
-import random
 
 def build_quad_grid_queue(config):
     keys = config['quad_keys']
     vals = np.arange(config['quad_range'][0], config['quad_range'][1]+config['quad_step'], config['quad_step'])
     queue = [dict(zip(keys, combo)) for combo in itertools.product(*(vals for _ in keys))]
+    # Add index to each dict
+    for idx, d in enumerate(queue):
+        d['index'] = idx
     return queue
 
 def build_quad_random_queue(config, n, m):
@@ -46,22 +60,15 @@ def build_quad_random_queue(config, n, m):
     keys = config['quad_keys']
     low, high = config['quad_range']
     queue = []
-    for _ in range(n):
+    idx = 0
+    for n_idx in range(n):
         quad_strengths = {k: random.uniform(low, high) for k in keys}
         for _ in range(m):
-            queue.append(quad_strengths.copy())
+            entry = quad_strengths.copy()
+            entry['index'] = n_idx
+            queue.append(entry)
+            idx += 1
     return queue
-
-
-import os
-import glob
-import json
-import time
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-from cpymad.madx import Madx
-import pymadx
 
 
 # Set working directory from CONFIG
