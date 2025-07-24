@@ -1,6 +1,6 @@
 # ELENA Extraction Beamline Simulation
 
-A minimal simulation of the ELENA extraction beam line using MAD‑X, combined with a proof‑of‑concept machine learning model to accelerate magnet tuning.
+Python layer above the MAD‑X ELENA extraction beam line simulation, including machine learning training pipelines for rapid magnet tuning.
 
 ## Overview
 
