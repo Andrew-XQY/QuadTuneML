@@ -22,18 +22,34 @@ CONFIG = {
         'betay': 5.3866337131,
         'alfy': 5.1980977991e-01,
     },
-    'output_csv': 'batch_results.csv',
-    'flush_every': 100
+    'output_csv': 'data/batch_results.csv',
+    'flush_every': 100,
 }
 
 ###############################################################################
 # QUEUE CONSTRUCTION (grid scan)
 ###############################################################################
 import itertools
+import random
+
 def build_quad_grid_queue(config):
     keys = config['quad_keys']
     vals = np.arange(config['quad_range'][0], config['quad_range'][1]+config['quad_step'], config['quad_step'])
     queue = [dict(zip(keys, combo)) for combo in itertools.product(*(vals for _ in keys))]
+    return queue
+
+def build_quad_random_queue(config, n, m):
+    """
+    Generate n sets of random quadrupole strengths (for the 4 quads),
+    each set repeated m times, for a total of n*m queue elements.
+    """
+    keys = config['quad_keys']
+    low, high = config['quad_range']
+    queue = []
+    for _ in range(n):
+        quad_strengths = {k: random.uniform(low, high) for k in keys}
+        for _ in range(m):
+            queue.append(quad_strengths.copy())
     return queue
 
 
@@ -219,7 +235,8 @@ def run_single(gconf: dict) -> dict:
 if __name__ == '__main__':
     import time
     start_time = time.time()
-    queue = build_quad_grid_queue(CONFIG)
+    # queue = build_quad_grid_queue(CONFIG)
+    queue = build_quad_random_queue(CONFIG, n=5, m=50)
     all_dicts = []
     for idx, quad_conf in enumerate(tqdm(queue, desc="Quad grid scan"), 1):
         merged = run_single(quad_conf)
