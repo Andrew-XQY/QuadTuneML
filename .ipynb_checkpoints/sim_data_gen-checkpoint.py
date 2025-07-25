@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from cpymad.madx import Madx
-from scipy.stats import qmc
 import pymadx
 
 ###############################################################################
@@ -61,29 +60,14 @@ def build_quad_random_queue(config, n, m):
     keys = config['quad_keys']
     low, high = config['quad_range']
     queue = []
+    idx = 0
     for n_idx in range(n):
         quad_strengths = {k: random.uniform(low, high) for k in keys}
         for _ in range(m):
             entry = quad_strengths.copy()
             entry['index'] = n_idx
             queue.append(entry)
-    return queue
-
-def build_quad_sobol_queue(config, n):
-    keys = config['quad_keys']
-    # assume config['quad_range'] = (low, high) for all quads
-    low = np.full(len(keys), config['quad_range'][0])
-    high = np.full(len(keys), config['quad_range'][1])
-
-    # create & draw Sobol samples in [0,1]^4, then scale to [low,high]
-    sampler = qmc.Sobol(d=len(keys), scramble=True)
-    unit_samples = sampler.random(n=n)
-    scaled = qmc.scale(unit_samples, low, high)
-
-    # build queue dicts
-    queue = [dict(zip(keys, row)) for row in scaled]
-    for idx, d in enumerate(queue):
-        d['index'] = idx
+            idx += 1
     return queue
 
 
@@ -259,7 +243,7 @@ if __name__ == '__main__':
     import time
     start_time = time.time()
     # queue = build_quad_grid_queue(CONFIG)
-    queue = build_quad_sobol_queue(CONFIG, n=3000)
+    queue = build_quad_random_queue(CONFIG, n=5, m=50)
     all_dicts = []
     for idx, quad_conf in enumerate(tqdm(queue, desc="Quad grid scan"), 1):
         merged = run_single(quad_conf)

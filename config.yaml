@@ -1,5 +1,5 @@
 # config.yaml
-data_path: "data/batch_results.csv"
+data_path: "data/"
 
 input_cols:  # columns of the system input
   - klne.zqmd.0208
