@@ -223,58 +223,6 @@ def process_df(df: pd.DataFrame, inputs, outputs, save_to, funcs):
             raise KeyError(f"Columns {tcol} and/or {pcol} not found in DataFrame")
     save_to_csv(res, save_to)
 
-def plot_true_vs_pred(y_true, y_pred, name, rng):
-    # label
-    if name in ('emittance_x','emittance_y'):
-        var = 'x' if name=='emittance_x' else 'y'
-        label_tex = rf'$\varepsilon_{var}\;(\mathrm{{mm}}\cdot\mathrm{{mrad}})$'
-    else:
-        label_tex = name
-
-    # constant 0–1 range
-    x = np.linspace(0, 1, 200)
-    blue   = '#1f77b4'
-    orange = '#ff7f0e'
-
-    # square figure
-    fig, ax = plt.subplots(figsize=(6, 6), dpi=600)
-
-    # ±rng/2 band
-    ax.fill_between(x, x - rng/2, x + rng/2,
-                    color=blue, alpha=0.3,
-                    label='Simulation variability')
-    ax.plot(x, x - rng/2, '-', color=blue, linewidth=0.5)
-    ax.plot(x, x + rng/2, '-', color=blue, linewidth=0.5)
-
-    # perfect‑prediction line
-    ax.plot([0, 1], [0, 1], '--', color=blue, linewidth=1,
-            label=r'$y = x$')
-
-    # data
-    ax.scatter(y_true, y_pred,
-               c=orange, alpha=0.8, s=5,
-               label='Data samples')
-
-    # labels
-    ax.set_xlabel(f'True {label_tex}')
-    ax.set_ylabel(f'Predicted {label_tex}')
-
-    # fixed axes and square aspect
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.set_aspect('equal', 'box')
-
-    # tick formatting (hide zero on y)
-    ax.yaxis.set_major_formatter(
-        FuncFormatter(lambda v, pos: '' if v == 0 else f'{v:g}')
-    )
-    ax.xaxis.set_major_formatter(
-        FuncFormatter(lambda v, pos: f'{v:g}')
-    )
-
-    # ax.legend(frameon=False, loc='best')
-    plt.tight_layout()
-    plt.show()
 
 def plot_error_distribution(y_true, y_pred, name):
     # compute percent error (since normalized to 1)
