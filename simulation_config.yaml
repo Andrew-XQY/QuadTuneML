@@ -1,0 +1,38 @@
+# Provisional pilot ranges, not measured operating tolerances.
+samples: 5000
+particles: 6000
+seed: 42
+workers: 4
+backend: madx  # Native TRACK preserves MATRIX elements; PTC rejects this lattice.
+output: results/pilot_20260907/data.csv
+lattice_root: /Users/andrewxu/Documents/Projects/MADX GuI Trails/madx/acc-models-tls-main/elena_extraction/lne02/line/lne_repo
+external_runner: /Users/andrewxu/Documents/Projects/MADX GuI Trails/madx/acc-models-tls-main/elena_extraction/lne02/line/general_lne02.madx
+initial_conditions: /Users/andrewxu/Documents/Projects/MADX GuI Trails/madx/acc-models-tls-main/elena_extraction/lne02/stitched/elena_stitched.inp
+quad_keys:
+  - klne.zqmd.0208
+  - klne.zqmf.0209
+  - klne.zqmd.0214
+  - klne.zqmf.0215
+quad_range: [-100.0, 100.0]
+alpha_fraction: 0.20
+sigma_delta_range: [0.0, 0.001]  # RMS (p-p0)/p0, NOT PTC sigmapt.
+beam:
+  kinetic_energy_gev: 0.0001  # Fixed 100 keV reference energy.
+  gemx: 3.333333333333333e-7  # Existing 2e-6/6 geometric RMS value.
+  gemy: 6.666666666666666e-7  # Existing 4e-6/6 geometric RMS value.
+  betax: 4.2206719082
+  betay: 5.3866337131
+  alfx: 2.6283720873
+  alfy: 0.51980977991
+  sigmat: 1.0e-12
+  # MAD-X dispersion is derivative w.r.t. PT, not delta; add D_PT * PT.
+  # Values copied from elena_stitched.inp; no measured beam calibration implied.
+  dispersion_pt: [61.931150219, 16.019682083, 0.0, 0.0]
+observations:
+  - LNE.TBS.0203
+  - LNE.ZQFF.0205
+  - LNE.ZCV.0214
+  - LNE.ZCH.0214
+  - LNE.ZQMF.0215
+  - LNE.VV.0226
+expected_segments: [start, LNE.TBS.0203, LNE.ZQFF.0205, LNE.ZCV.0214, LNE.ZCH.0214, LNE.ZQMF.0215, LNE.VV.0226, end]

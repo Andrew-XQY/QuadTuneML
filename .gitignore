@@ -1,0 +1,22 @@
+# 1) ignore everything
+*
+# 2) but don’t ignore directories (so the tree is kept)
+!*/
+# 3) and don’t ignore our desired file types
+!*.ipynb
+!*.py
+!*.yaml
+!*.md
+# 4) plus allow our placeholder so we can track empty dirs
+!*.gitkeep
+
+# Local execution environments and reproducible dependency manifests
+.venv/
+__pycache__/
+!requirements.txt
+!requirements-lock.txt
+
+# Keep the ignore policy reviewable; generated run artifacts stay local.
+!/.gitignore
+/results/*
+!/results/.gitkeep

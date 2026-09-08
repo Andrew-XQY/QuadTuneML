@@ -1,0 +1,25 @@
+# Standalone seven-input training; config.yaml remains the historical notebook config.
+# Run: python train.py --data results/pilot_20260907/data.csv --output-dir results/pilot_20260907/training
+input_cols:
+  - klne.zqmd.0208
+  - klne.zqmf.0209
+  - klne.zqmd.0214
+  - klne.zqmf.0215
+  - alfx
+  - alfy
+  - sigma_delta  # RMS (p - p0) / p0; not PTC's pt coordinate
+
+target_cols:
+  - emittance_x
+  - emittance_y
+segment: 7  # eighth observation, selected from each legacy eight-value output list
+
+# Natural-log targets, then input/target minmax scaling fitted on training rows only.
+# Repeated full input tuples are kept in one split.
+test_size: 0.1
+val_size: 0.1
+batch_size: 32
+learning_rate: 1.0e-4
+epochs: 100
+seed: 42
+patience: 5

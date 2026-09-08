@@ -1,288 +1,444 @@
-import itertools
-import random
-import os
-import glob
+"""Generate the seven-input alpha/momentum-spread pilot with isolated MAD-X jobs.
+
+Run ``python sim_data_gen.py --help``. All generated files stay in repo results/.
+The external lattice is read and snapshotted; its original driver is never run.
+Native MAD-X TRACK supports this lattice's MATRIX elements and thick quadrupoles.
+Neither backend configures space charge. PTC is selectable, but rejects MATRIX.
+"""
+import argparse
+import csv
+import hashlib
+import importlib.metadata
 import json
+import math
+import multiprocessing as mp
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
 import time
+
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
-from cpymad.madx import Madx
 from scipy.stats import qmc
-import pymadx
+import yaml
 
-###############################################################################
-# CONFIGURATION (all parameters here for easy future config-driven use)
-###############################################################################
-CONFIG = {
-    'home_path': '/Users/andrewxu/Documents/Projects/MADX GuI Trails/madx/acc-models-tls-main/elena_extraction/lne02/line',
-    'lne02_str_path': '/Users/andrewxu/Documents/Projects/MADX GuI Trails/madx/acc-models-tls-main/elena_extraction/lne02/line/lne_repo/lne02/lne02_k.str',
-    'trackone_dir': '/Users/andrewxu/Documents/Projects/MADX GuI Trails/madx/acc-models-tls-main/elena_extraction/lne02/line',
-    'quad_keys': [
-        'klne.zqmd.0208',
-        'klne.zqmf.0209',
-        'klne.zqmd.0214',
-        'klne.zqmf.0215',
-    ],
-    'quad_range': [-100, 100],
-    'quad_step': 20,
-    'particles_per_sim': 6000,
-    'beam_params': {
-        'gemx': 2e-6/6,
-        'betax': 4.2206719082,
-        'alfx': 2.6283720873,
-        'gemy': 4e-6/6,
-        'betay': 5.3866337131,
-        'alfy': 5.1980977991e-01,
-    },
-    'output_csv': 'data/batch_results.csv',
-    'flush_every': 10,
-}
-os.makedirs(os.path.join(CONFIG['home_path'], 'data'), exist_ok=True)
 
-###############################################################################
-# QUEUE CONSTRUCTION (grid scan)
-###############################################################################
+REPO_ROOT = Path(__file__).resolve().parent
+OUTPUT_KEYS = ["mean_x", "mean_y", "sigma_x", "sigma_y", "emittance_x",
+               "emittance_y", "transmission"]
+_WORKER = {}
 
-def build_quad_grid_queue(config):
-    keys = config['quad_keys']
-    vals = np.arange(config['quad_range'][0], config['quad_range'][1]+config['quad_step'], config['quad_step'])
-    queue = [dict(zip(keys, combo)) for combo in itertools.product(*(vals for _ in keys))]
-    # Add index to each dict
-    for idx, d in enumerate(queue):
-        d['index'] = idx
-    return queue
 
-def build_quad_random_queue(config, n, m):
+def load_config(path):
+    with open(path) as stream:
+        config = yaml.safe_load(stream)
+    if len(config["quad_keys"]) != 4:
+        raise ValueError("Exactly four quadrupole inputs are required")
+    if len(config["expected_segments"]) != 8:
+        raise ValueError("Historical output schema requires exactly eight segments")
+    if config.get("backend", "madx") not in ("madx", "ptc"):
+        raise ValueError("backend must be madx or ptc; there is no silent fallback")
+    beam = config["beam"]
+    for key in ("gemx", "gemy", "betax", "betay", "kinetic_energy_gev"):
+        if not np.isfinite(beam[key]) or beam[key] <= 0:
+            raise ValueError("beam.{} must be finite and positive".format(key))
+    if not 0 <= config["alpha_fraction"] < 1:
+        raise ValueError("alpha_fraction must lie in [0, 1)")
+    low, high = config["sigma_delta_range"]
+    if not 0 <= low < high:
+        raise ValueError("sigma_delta_range must satisfy 0 <= low < high")
+    if len(beam["dispersion_pt"]) != 4:
+        raise ValueError("dispersion_pt must contain DX, DPX, DY, DPY")
+    return config
+
+
+def build_quad_sobol_queue(config, n, seed=None):
+    """Seven-dimensional scrambled Sobol prefix, stable across worker counts."""
+    if n < 1:
+        raise ValueError("samples must be positive")
+    keys = config["quad_keys"] + ["alfx", "alfy", "sigma_delta"]
+    ranges = [config["quad_range"] for _ in config["quad_keys"]]
+    for key in ("alfx", "alfy"):
+        alpha = config["beam"][key]
+        width = abs(alpha) * config["alpha_fraction"]
+        ranges.append([alpha - width, alpha + width])
+    ranges.append(config["sigma_delta_range"])
+    bounds = np.asarray(ranges, dtype=float)
+    if np.any(bounds[:, 1] < bounds[:, 0]) or not np.isfinite(bounds).all():
+        raise ValueError("Invalid scan bounds")
+    sampler = qmc.Sobol(d=len(keys), scramble=True,
+                        seed=config["seed"] if seed is None else seed)
+    unit = sampler.random_base2(m=int(math.ceil(math.log2(n))))[:n]
+    values = bounds[:, 0] + unit * (bounds[:, 1] - bounds[:, 0])
+    return [dict(zip(keys, row), index=index) for index, row in enumerate(values)]
+
+
+def delta_to_pt(delta, beta0):
+    """Exact PT=(E-E0)/(p0*c), rationalized to avoid low-energy cancellation.
+
+    From (1+delta)^2 = 1 + 2*PT/beta0 + PT^2. See CERN's
+    MAD-X canonical variables: https://indico.cern.ch/event/350735/contributions/
+    826022/attachments/693330/952005/madX_Nov_6_2014.pdf (slide 3).
     """
-    Generate n sets of random quadrupole strengths (for the 4 quads),
-    each set repeated m times, for a total of n*m queue elements.
+    delta = np.asarray(delta, dtype=float)
+    if not 0 < beta0 <= 1 or not np.isfinite(delta).all() or np.any(delta <= -1):
+        raise ValueError("Require physical beta0 and finite delta > -1")
+    change = delta * (2.0 + delta)
+    return beta0 * change / (np.sqrt(1.0 + beta0 * beta0 * change) + 1.0)
+
+
+def pt_to_delta(pt, beta0):
+    """Stable inverse used for independent tracking/serialization validation."""
+    pt = np.asarray(pt, dtype=float)
+    change = 2.0 * pt / beta0 + pt * pt
+    return change / (np.sqrt(1.0 + change) + 1.0)
+
+
+def rms_emittance(x, px, centered=False):
+    if centered:
+        x, px = x - np.mean(x), px - np.mean(px)
+    x2, p2, xp = np.mean(x * x), np.mean(px * px), np.mean(x * px)
+    determinant = x2 * p2 - xp * xp
+    if determinant < -1e-10 * max(x2 * p2, np.finfo(float).tiny):
+        raise ValueError("Nonphysical covariance determinant")
+    return float(np.sqrt(max(0.0, determinant)))
+
+
+def generate_particles(config, settings, beta0):
+    """Match pymadx GaussGenerator's transverse covariance in canonical x,px.
+
+    Use a seed per simulation, so parallel scheduling cannot change the beam.
+    Transverse geometric emittances retain the old generator's convention.
+    Incoming dispersive correlations are added in the MAD-X PT convention.
     """
-    keys = config['quad_keys']
-    low, high = config['quad_range']
-    queue = []
-    for n_idx in range(n):
-        quad_strengths = {k: random.uniform(low, high) for k in keys}
-        for _ in range(m):
-            entry = quad_strengths.copy()
-            entry['index'] = n_idx
-            queue.append(entry)
-    return queue
-
-def build_quad_sobol_queue(config, n):
-    keys = config['quad_keys']
-    # assume config['quad_range'] = (low, high) for all quads
-    low = np.full(len(keys), config['quad_range'][0])
-    high = np.full(len(keys), config['quad_range'][1])
-
-    # create & draw Sobol samples in [0,1]^4, then scale to [low,high]
-    sampler = qmc.Sobol(d=len(keys), scramble=True)
-    unit_samples = sampler.random(n=n)
-    scaled = qmc.scale(unit_samples, low, high)
-
-    # build queue dicts
-    queue = [dict(zip(keys, row)) for row in scaled]
-    for idx, d in enumerate(queue):
-        d['index'] = idx
-    return queue
+    rng = np.random.default_rng(np.random.SeedSequence([config["seed"], settings["index"]]))
+    z = rng.normal(size=(config["particles"], 6))
+    rays = np.empty_like(z)
+    beam = config["beam"]
+    betatron = []
+    for axis, offset in (("x", 0), ("y", 2)):
+        emit, beta, alpha = beam["gem" + axis], beam["beta" + axis], settings["alf" + axis]
+        x = np.sqrt(emit * beta) * z[:, offset]
+        px = np.sqrt(emit / beta) * (z[:, offset + 1] - alpha * z[:, offset])
+        rays[:, offset], rays[:, offset + 1] = x, px
+        betatron.append((x.copy(), px.copy()))
+    delta = settings["sigma_delta"] * z[:, 5]
+    rays[:, 4] = beam["sigmat"] * z[:, 4]
+    rays[:, 5] = delta_to_pt(delta, beta0)
+    rays[:, :4] += rays[:, 5, None] * np.asarray(beam["dispersion_pt"])
+    stats = {"realized_sigma_delta": float(np.std(delta)),
+             "realized_mean_delta": float(np.mean(delta)),
+             "realized_sigma_pt": float(np.std(rays[:, 5])), "beta0": float(beta0)}
+    for axis, (x, px) in zip(("x", "y"), betatron):
+        emit = rms_emittance(x, px, centered=True)
+        stats["realized_alf" + axis] = float(-np.mean((x-x.mean())*(px-px.mean())) / emit)
+        stats["realized_gem" + axis] = emit
+    return rays, stats
 
 
-# Set working directory from CONFIG
-os.chdir(CONFIG['home_path'])
+def write_inrays(path, rays, backend="ptc"):
+    with open(path, "w") as stream:
+        for row in rays:
+            command = "ptc_start" if backend == "ptc" else "start"
+            stream.write(command + ", x={:.17g}, px={:.17g}, y={:.17g}, py={:.17g}, t={:.17g}, pt={:.17g};\n".format(*row))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1) PARSERS & CALCULATORS
-# ─────────────────────────────────────────────────────────────────────────────
 
-def parse_trackone_to_df(filepath: str) -> pd.DataFrame:
-    """
-    Parse a MAD-X TRACKONE file into a pandas DataFrame with a 'segment' column.
-    """
-    rows, seg_ids, columns = [], [], []
+def parse_trackone_to_df(filepath):
+    rows, segments, names, columns = [], [], [], None
     segment = 0
-
-    with open(filepath, 'r') as f:
-        for raw in f:
+    with open(filepath) as stream:
+        for raw in stream:
             line = raw.strip()
-            if not line or line.startswith('@') or line.startswith('$'):
-                continue
-            if line.startswith('*'):
+            if line.startswith("*"):
                 columns = line[1:].split()
-                continue
-            if line.startswith('#segment'):
+            elif line.startswith("#segment"):
                 segment += 1
-                continue
+                names.append(line.split()[-1])
+            elif line and not line.startswith(("@", "$", "#")):
+                parts = line.split()
+                if columns is None or segment == 0 or len(parts) != len(columns):
+                    raise ValueError("Malformed TRACKONE data line")
+                rows.append([float(x.replace("D", "E")) for x in parts])
+                segments.append(segment)
+    if not rows:
+        raise ValueError("Empty TRACKONE output")
+    frame = pd.DataFrame(rows, columns=columns)
+    frame["segment"] = segments
+    frame.attrs["segment_names"] = names
+    return frame
 
-            parts = line.split()
-            if columns and len(parts) == len(columns):
-                values = [float(x) for x in parts]
-                rows.append(values)
-                seg_ids.append(segment)
 
-    df = pd.DataFrame(rows, columns=columns)
-    df['segment'] = seg_ids
-    return df
-
-
-def calculate_beam_parameters(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute mean_x, mean_y, sigma_x, sigma_y, emittance_x, emittance_y, transmission
-    for each segment in the TRACKONE DataFrame.
-    """
-    def rms_emittance(x, px):
-        x2 = np.mean(x*x)
-        px2 = np.mean(px*px)
-        xp =  np.mean(x*px)
-        return np.sqrt(x2*px2 - xp*xp)
-
-    groups = df.groupby('segment')
-    N0 = groups.size().iloc[0]
-
+def calculate_beam_parameters(frame, particles=None, expected_segments=None):
+    """Preserve historical raw-second-moment canonical emittance output lists."""
+    required = ["X", "PX", "Y", "PY", "T", "PT", "S"]
+    if not all(key in frame for key in required) or not np.isfinite(frame[required].values).all():
+        raise ValueError("Missing or nonfinite tracking coordinates")
+    names = frame.attrs.get("segment_names", [])
+    if expected_segments and [s.lower() for s in names] != [s.lower() for s in expected_segments]:
+        raise ValueError("Unexpected TRACKONE segment names: {}".format(names))
+    groups = frame.groupby("segment", sort=True)
+    n0 = int(groups.size().iloc[0])
+    if particles is not None and n0 != particles:
+        raise ValueError("Initial particle count differs from requested count")
+    if len(groups) != len(names):
+        raise ValueError("An observation segment has no tracked particles")
     records = []
-    for seg, g in groups:
-        x, y = g['X'].to_numpy(), g['Y'].to_numpy()
-        px, py = g['PX'].to_numpy(), g['PY'].to_numpy()
-        N = len(x)
-
-        # centroids
-        mx, my = x.mean(), y.mean()
-        # rms sizes
-        sx = np.sqrt(np.mean((x - mx)**2))
-        sy = np.sqrt(np.mean((y - my)**2))
-        # emittances (unchanged)
-        ex = rms_emittance(x, px)
-        ey = rms_emittance(y, py)
-        # transmission
-        T  = N / N0
-
-        records.append({
-            'segment':       seg,
-            'mean_x':        mx,
-            'mean_y':        my,
-            'sigma_x':       sx,
-            'sigma_y':       sy,
-            'emittance_x':   ex,
-            'emittance_y':   ey,
-            'transmission':  T,
-        })
-
-    out = pd.DataFrame(records).set_index('segment')
-    return out
+    for segment, group in groups:
+        x, px, y, py = [group[key].to_numpy() for key in ("X", "PX", "Y", "PY")]
+        records.append(dict(segment=segment, mean_x=float(x.mean()), mean_y=float(y.mean()),
+                            sigma_x=float(x.std()), sigma_y=float(y.std()),
+                            emittance_x=rms_emittance(x, px), emittance_y=rms_emittance(y, py),
+                            transmission=len(group) / n0))
+    result = pd.DataFrame(records).set_index("segment")
+    if not np.isfinite(result.values).all() or (result[["emittance_x", "emittance_y"]] <= 0).any().any():
+        raise ValueError("Nonfinite or nonpositive output emittance")
+    return result
 
 
-def beam_df_to_dict(beam_df: pd.DataFrame) -> dict:
-    """
-    Flatten an 8×N beam‐parameter DataFrame into a dict of lists.
-    """
-    return beam_df.to_dict(orient="list")
+def lattice_files():
+    return ["deflectors.ele"] + ["{0}/{0}{1}".format(line, suffix)
+        for line in ("lne00", "lne01", "lne02") for suffix in (".ele", "_k.str", ".seq")]
 
 
-def merge_dicts(*dicts) -> dict:
-    """
-    Merge any number of dicts; later ones override earlier keys.
-    """
-    merged = {}
-    for d in dicts:
-        if not isinstance(d, dict):
-            raise ValueError(f"Expected dict, got {type(d)}")
-        merged.update(d)
-    return merged
-
-def save_metadata_txt(metadata: dict, filepath: str):
-    """
-    Save a flat dict of metadata to a human-readable TXT file,
-    one key:value per line.
-    """
-    # make sure the directory exists
-    os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
-    with open(filepath, 'w') as f:
-        for key, val in metadata.items():
-            f.write(f"{key}: {val}\n")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2) SIMULATION DRIVER
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Output/input file locations to match CONFIG
-TRACKONE_DIR = CONFIG['trackone_dir']
-OUTPUT_CSV   = CONFIG['output_csv']
-FLUSH_EVERY  = CONFIG['flush_every']
+def snapshot_sources(config, output_dir):
+    """Copy only known static model files. Never execute the external driver."""
+    snapshot = output_dir / "source_lattice"
+    snapshot.mkdir()
+    hashes = {}
+    for relative in lattice_files():
+        source = Path(config["lattice_root"]) / relative
+        text = source.read_text()
+        commands = re.sub(r"/\*.*?\*/|!.*?$", "", text, flags=re.S | re.M)
+        if re.search(r"(?:^|;)\s*(?:system|call|stop|match|exec)\b", commands, re.I):
+            raise ValueError("Unexpected executable control command in {}".format(source))
+        target = snapshot / relative
+        target.parent.mkdir(exist_ok=True)
+        shutil.copy2(str(source), str(target))
+        hashes[str(source)] = hashlib.sha256(target.read_bytes()).hexdigest()
+    for key in ("external_runner", "initial_conditions"):
+        source = Path(config[key])
+        target = output_dir / ("original_" + source.name)
+        shutil.copy2(str(source), str(target))
+        hashes[str(source)] = hashlib.sha256(target.read_bytes()).hexdigest()
+    return snapshot, hashes
 
 
-def run_single(gconf: dict) -> dict:
-    """
-    Run one MAD-X job with quadrupoles set by gconf.
-    Returns the merged dict of beam params + gconf.
-    """
+def build_runner(config, settings):
+    """Standalone tracking driver; no matching, shell commands or source writes."""
+    beam = config["beam"]
+    lines = ["option, -echo;", "option, rbarc=false;", "beam, particle=antiproton;",
+             "mass=beam->mass;", "Ekin={:.17g};".format(beam["kinetic_energy_gev"]),
+             "gamman=1+Ekin/mass;", "beta=sqrt(1-1/gamman^2);",
+             "pcn=sqrt(Ekin*(Ekin+2*mass));",
+             "beam, particle=antiproton, pc=pcn, exn=6e-6/6, eyn=4e-6/6;"]
+    for relative in lattice_files():
+        lines.append('call, file="lattice/{}";'.format(relative))
+        if relative == "lne00/lne00.seq":
+            lines.append("extract, sequence=lne00, from=lne.start.0000, to=lne.lne00.lne01, newname=lne00to01;")
+        elif relative == "lne01/lne01.seq":
+            lines.append("extract, sequence=lne01, from=lne.start.0100, to=lne.lne01.lne02, newname=lne01to02;")
+    lines += ["lne00lne01lne02: sequence, refer=entry, l=10.6361309+6.2625788+7.653745125;",
+              "lne00to01, at=0;", "lne01to02, at=10.6361309;", "lne02, at=10.6361309+6.2625788;",
+              "endsequence;", "seqedit, sequence=lne00lne01lne02; flatten; endedit;"]
+    lines += ["{}={:.17g};".format(key, settings[key]) for key in config["quad_keys"]]
+    lines.append("use, sequence=lne00lne01lne02;")
+    if config.get("backend", "madx") == "ptc":
+        lines += ["ptc_create_universe;",
+                  "ptc_create_layout, model=2, method=6, nst=3, exact=true, time=true;",
+                  'call, file="inrays.madx";']
+        lines += ["ptc_observe, place={};".format(name) for name in config["observations"]]
+        lines += ["ptc_track, icase=5, closed_orbit=false, dump, element_by_element=true,",
+                  "maxaper={1,1,1,1,1e9,1e9,1e9}, onetable=true, turns=1, ffile=1;",
+                  "ptc_track_end;", "ptc_end;"]
+    else:
+        lines += ["track, onepass=true, onetable=true, dump=true, aperture=true, recloss=true;",
+                  'call, file="inrays.madx";']
+        lines += ["observe, place={};".format(name) for name in config["observations"]]
+        # Broad numerical guards, not physical apertures. Delta creates large
+        # arrival-time offsets at 100 keV; do not cut on the longitudinal T.
+        lines += ["run, turns=1, maxaper={1,1,1,1,1e9,1e9}, ffile=1;", "endtrack;"]
+    return "\n".join(lines) + "\n"
 
 
-    # 1) Write quadrupole strengths to .str file (as in GUI code)
-    with open(CONFIG['lne02_str_path'], 'w') as file:
-        file.write(f"! LNE02\n")
-        for k in CONFIG['quad_keys']:
-            file.write(f"{k} = {gconf[k]};\n")
-
-    # 2) start MAD-X quietly
-    madx = Madx(stdout=False)
-
-    # 3) generate beam with pymadx GaussGenerator
-    bp = CONFIG['beam_params']
-    G = pymadx.Ptc.GaussGenerator(
-        gemx=bp['gemx'], betax=bp['betax'], alfx=bp['alfx'],
-        gemy=bp['gemy'], betay=bp['betay'], alfy=bp['alfy'],
-        sigmat=1e-12, sigmapt=1e-12
-    )
-    G.Generate(nToGenerate=CONFIG['particles_per_sim'], fileName='inrays.madx')
-
-    # 4) call your MAD-X sequence
-    madx.call(file='general_lne02.madx')
-
-    # 5) pick up TRACKONE and parse
-    trackone_file = os.path.join(CONFIG['trackone_dir'], 'trackone')
-    df = parse_trackone_to_df(trackone_file)
-
-    # 6) beam parameters
-    beam_df = calculate_beam_parameters(df)
-    beam_dict = beam_df_to_dict(beam_df)
-
-    # 7) merge and return
-    return merge_dicts(beam_dict, gconf)
+def _initialize_worker(config, snapshot, output_dir):
+    work = Path(output_dir) / ".work" / ("worker-" + str(os.getpid()))
+    work.mkdir(parents=True)
+    shutil.copytree(str(snapshot), str(work / "lattice"))
+    _WORKER.update(config=config, work=work)
 
 
+def run_single(settings):
+    """Each job owns a fresh MAD-X subprocess, in a worker-private directory."""
+    from cpymad.madx import Madx
+    config, work = _WORKER["config"], _WORKER["work"]
+    start = time.monotonic()
+    stats = dict(settings)
+    try:
+        for filename in ("trackone", "trackloss", "trackloss.csv"):
+            (work / filename).unlink(missing_ok=True)
+        with open(work / "madx.log", "w") as logfile:
+            with Madx(stdout=logfile) as madx:
+                stats["madx_version"] = str(madx.version)
+                with madx.chdir(str(work)):
+                    madx.input("beam, particle=antiproton;")
+                    mass = float(madx.beam.mass)
+                    kinetic = config["beam"]["kinetic_energy_gev"]
+                    momentum = math.sqrt(kinetic * (kinetic + 2 * mass))
+                    beta0 = momentum / (mass + kinetic)
+                    rays, realized = generate_particles(config, settings, beta0)
+                    stats.update(realized, p0_gev_c=momentum)
+                    write_inrays(work / "inrays.madx", rays, config.get("backend", "madx"))
+                    script = build_runner(config, settings)
+                    (work / "runner.madx").write_text(script)
+                    madx.call("runner.madx")
+                    stats["lost_particles"] = 0
+                    stats["nonfinite_lost_particles"] = 0
+                    stats["finite_lost_particles"] = 0
+                    stats["loss_locations"] = "{}"
+                    if "trackloss" in madx.table:
+                        loss = madx.table.trackloss.dframe()
+                        stats["lost_particles"] = len(loss)
+                        if len(loss):
+                            lost_coordinates = loss[["x", "px", "y", "py", "t", "pt"]].values
+                            stats["nonfinite_lost_particles"] = int((~np.isfinite(lost_coordinates).all(axis=1)).sum())
+                            stats["finite_lost_particles"] = len(loss) - stats["nonfinite_lost_particles"]
+                            location = next((key for key in ("name", "element") if key in loss), None)
+                            stats["loss_locations"] = json.dumps(loss[location].value_counts().to_dict()) if location else "unavailable"
+                            loss.to_csv(work / "trackloss.csv", index=False)
+                    for key in config["quad_keys"]:
+                        if not np.isclose(float(madx.globals[key]), settings[key], rtol=1e-12, atol=1e-12):
+                            raise ValueError("Sampled quadrupole strength was changed: " + key)
+        frame = parse_trackone_to_df(work / "trackone")
+        nonfinite = ~np.isfinite(frame[["X", "PX", "Y", "PY", "T", "PT", "S"]].values).all(axis=1)
+        stats["nonfinite_rows"] = int(nonfinite.sum())
+        stats["nonfinite_segments"] = json.dumps(frame[nonfinite].groupby("segment").size().to_dict())
+        stats["actual_segment_names"] = json.dumps(frame.attrs["segment_names"])
+        if config.get("backend", "madx") == "madx":
+            # Normalize only the verified native end label, not arbitrary names.
+            frame.attrs["segment_names"] = ["end" if name.lower() == "lne00lne01lne02$end"
+                                              else name for name in frame.attrs["segment_names"]]
+        beam = calculate_beam_parameters(frame, config["particles"], config["expected_segments"])
+        first = frame[frame.segment == 1]
+        actual_delta = pt_to_delta(first.PT.to_numpy(), beta0)
+        stats["tracked_initial_sigma_delta"] = float(np.std(actual_delta))
+        if not np.isclose(stats["tracked_initial_sigma_delta"], stats["realized_sigma_delta"], rtol=1e-8, atol=1e-14):
+            raise ValueError("TRACKONE initial PT differs from generated momentum spread")
+        final = frame[frame.segment == len(config["expected_segments"])]
+        if config.get("backend", "madx") == "madx" and len(final) + stats["lost_particles"] != config["particles"]:
+            raise ValueError("Final survivors plus recorded losses do not equal initial particles")
+        for axis in ("x", "y"):
+            stats["final_centered_emittance_" + axis] = rms_emittance(
+                final[axis.upper()].values, final[("p"+axis).upper()].values, centered=True)
+        stats.update(status="ok", seconds=time.monotonic()-start,
+                     final_particles=len(final), error="")
+        return dict(settings, **beam.to_dict(orient="list")), stats
+    except Exception as error:
+        failure_dir = work.parent.parent / "failed_cases" / str(settings["index"])
+        failure_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("runner.madx", "inrays.madx", "madx.log", "trackloss.csv"):
+            if (work / name).exists():
+                shutil.copy2(str(work / name), str(failure_dir / name))
+        stats.update(status="failed", seconds=time.monotonic()-start,
+                     error="{}: {}".format(type(error).__name__, error))
+        return None, stats
 
 
+def run_batch(config, repo_root=REPO_ROOT):
+    output = Path(config["output"])
+    output = (Path(repo_root) / output).resolve() if not output.is_absolute() else output.resolve()
+    results_root = (Path(repo_root) / "results").resolve()
+    if results_root not in output.parents:
+        raise ValueError("Output must be inside this repository's results/ directory")
+    output_dir = output.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if any((output_dir / name).exists() for name in (output.name, "metadata.json", "source_lattice")):
+        raise FileExistsError("Use a fresh run directory to preserve previous results")
+    if config["particles"] < 3 or config["workers"] < 1:
+        raise ValueError("Require particles >= 3 and workers >= 1")
+    snapshot, hashes = snapshot_sources(config, output_dir)
+    queue = build_quad_sobol_queue(config, config["samples"])
+    (output_dir / "runner_template.madx").write_text(build_runner(config, queue[0]))
+    (output_dir / "simulation_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
+    metadata = dict(status="running", configuration=config, source_sha256=hashes,
+                    generator_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    runner_template_sha256=hashlib.sha256((output_dir / "runner_template.madx").read_bytes()).hexdigest(),
+                    python=sys.version, executable=sys.executable,
+                    package_versions={name: importlib.metadata.version(name) for name in
+                                      ("numpy", "pandas", "scipy", "PyYAML", "cpymad")},
+                    input_columns=config["quad_keys"]+["alfx", "alfy", "sigma_delta"],
+                    output_columns=OUTPUT_KEYS, expected_segments=config["expected_segments"],
+                    backend=config.get("backend", "madx"),
+                    backend_reason="Native TRACK preserves original MATRIX maps and thick quadrupoles; PTC rejects MATRIX. No automatic fallback.",
+                    numerical_guards=[1, 1, 1, 1, 1e9, 1e9], hardware_aperture_model=False,
+                    aperture_checks_enabled=True,
+                    loss_interpretation="Numerical-domain or broad-guard losses, not measured hardware aperture losses. Emittance targets describe surviving particles; tail loss can reduce them.",
+                    space_charge=False, sigma_delta_definition="RMS (p-p0)/p0",
+                    pt_definition="(E-E0)/(p0*c); native canonical PT, or PTC time=true",
+                    transverse_convention="canonical x,px; historical uncentered RMS emittance targets",
+                    dispersion_convention="entrance coordinates += [DX,DPX,DY,DPY]_PT * PT",
+                    note="Provisional beam/ranges; independent measured-beam calibration not performed.",
+                    completed=0, failed=0, requested=len(queue), started_unix=time.time())
+    metadata_path = output_dir / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+    started = time.monotonic()
+    diag_keys = list(queue[0]) + ["status", "seconds", "realized_sigma_delta", "realized_mean_delta",
+        "realized_sigma_pt", "beta0", "realized_alfx", "realized_gemx", "realized_alfy",
+        "realized_gemy", "p0_gev_c", "tracked_initial_sigma_delta", "final_particles",
+        "final_centered_emittance_x", "final_centered_emittance_y", "actual_segment_names",
+        "lost_particles", "nonfinite_lost_particles", "finite_lost_particles", "loss_locations",
+        "nonfinite_rows", "nonfinite_segments", "madx_version", "error"]
+    with open(output, "w", newline="") as data_stream, open(output_dir / "diagnostics.csv", "w", newline="") as diag_stream, open(output_dir / "failures.jsonl", "w") as failures:
+        data_writer = csv.DictWriter(data_stream, fieldnames=list(queue[0])+OUTPUT_KEYS)
+        diag_writer = csv.DictWriter(diag_stream, fieldnames=diag_keys)
+        data_writer.writeheader()
+        diag_writer.writeheader()
+        context = mp.get_context("spawn")
+        with context.Pool(config["workers"], initializer=_initialize_worker,
+                          initargs=(config, str(snapshot), str(output_dir))) as pool:
+            for row, stats in pool.imap(run_single, queue, chunksize=1):
+                diag_writer.writerow(stats)
+                if row is None:
+                    metadata["failed"] += 1
+                    failures.write(json.dumps(stats) + "\n")
+                    failures.flush()
+                else:
+                    data_writer.writerow(row)
+                    metadata["completed"] += 1
+                    if "actual_segment_names" not in metadata:
+                        metadata["actual_segment_names"] = json.loads(stats["actual_segment_names"])
+                        metadata["madx_version"] = stats["madx_version"]
+                done = metadata["completed"] + metadata["failed"]
+                if done % 10 == 0 or done == len(queue):
+                    data_stream.flush()
+                    diag_stream.flush()
+                    metadata["elapsed_seconds"] = time.monotonic()-started
+                    metadata_path.write_text(json.dumps(metadata, indent=2))
+                    print("{}/{} completed; {} failed; {:.1f}s".format(
+                        done, len(queue), metadata["failed"], metadata["elapsed_seconds"]), flush=True)
+    metadata.update(status="complete" if not metadata["failed"] else "complete_with_failures",
+                    elapsed_seconds=time.monotonic()-started, finished_unix=time.time())
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+    return metadata
 
-###############################################################################
-# MAIN LOOP: minimal, modular, queue-driven
-###############################################################################
-if __name__ == '__main__':
-    import time
-    start_time = time.time()
-    # queue = build_quad_grid_queue(CONFIG)
-    queue = build_quad_sobol_queue(CONFIG, n=3000)
-    all_dicts = []
-    for idx, quad_conf in enumerate(tqdm(queue, desc="Quad grid scan"), 1):
-        merged = run_single(quad_conf)
-        all_dicts.append(merged)
-        if idx % CONFIG['flush_every'] == 0:
-            pd.DataFrame(all_dicts).to_csv(CONFIG['output_csv'], index=False)
-    pd.DataFrame(all_dicts).to_csv(CONFIG['output_csv'], index=False)
-    print(f"\nAll done! Results in {CONFIG['output_csv']}")
 
-    # Save metadata
-    end_time = time.time()
-    total_runs = len(all_dicts)
-    total_time = end_time - start_time
-    avg_time = total_time / total_runs if total_runs else 0
-    metadata = {
-        'total_simulations': total_runs,
-        'total_time_seconds': total_time,
-        'avg_time_per_simulation_seconds': avg_time,
-        'total_time_hours': total_time / 3600,
-        'avg_time_per_simulation_ms': avg_time * 1000,
-        'timestamp_start': start_time,
-        'timestamp_end': end_time
-    }
-    META_JSON = CONFIG['output_csv'].replace('.csv', '.json')
-    with open(META_JSON, 'w') as f:
-        json.dump(metadata, f, indent=2)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=REPO_ROOT / "simulation_config.yaml")
+    for key in ("samples", "particles", "seed", "workers"):
+        parser.add_argument("--" + key, type=int)
+    parser.add_argument("--output", help="CSV path inside this repository's results/")
+    parser.add_argument("--backend", choices=("madx", "ptc"))
+    args = parser.parse_args()
+    config = load_config(args.config)
+    for key in ("samples", "particles", "seed", "workers", "output", "backend"):
+        value = getattr(args, key)
+        if value is not None:
+            config[key] = value
+    metadata = run_batch(config)
+    return 1 if metadata["failed"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
