@@ -1,6 +1,8 @@
 """Checks for leakage, coordinate shape and reversible log preprocessing (no TF)."""
 import importlib.util
+import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -24,6 +26,29 @@ class TrainingDataTests(unittest.TestCase):
         self.frame = pd.DataFrame(rng.uniform(0.1, 1, (40, 7)), columns=self.config['input_cols'])
         self.frame['emittance_x'] = np.exp(rng.uniform(-10, -8, 40))
         self.frame['emittance_y'] = np.exp(rng.uniform(-11, -7, 40))
+
+    def test_progress_json_is_atomic_for_live_readers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'progress.json'
+            train.write_json(path, {'completed_fits': 0})
+            done = threading.Event()
+
+            def publish():
+                try:
+                    for count in range(100):
+                        train.write_json(path, {'completed_fits': count})
+                finally:
+                    done.set()
+
+            worker = threading.Thread(target=publish)
+            worker.start()
+            try:
+                while not done.is_set():
+                    # Truncate-then-write intermittently exposes invalid JSON.
+                    self.assertIn('completed_fits', json.loads(path.read_text()))
+            finally:
+                worker.join()
+            self.assertEqual(json.loads(path.read_text())['completed_fits'], 99)
 
     def test_duplicate_settings_stay_in_one_split(self):
         repeated = pd.concat([self.frame, self.frame], ignore_index=True)

@@ -1,5 +1,6 @@
 """Regression check of actual per-epoch row delivery in the production TF pipeline."""
 import importlib.util
+import tempfile
 from pathlib import Path
 import unittest
 
@@ -35,6 +36,33 @@ class EpochTracker(tf.keras.callbacks.Callback):
 
 
 class EpochShuffleTests(unittest.TestCase):
+    def test_warmup_retains_global_best_validation_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = tf.keras.Sequential([tf.keras.Input(shape=(1,)),
+                                         tf.keras.layers.Dense(1, use_bias=False)])
+            model.stop_training = False
+            callbacks, checkpoint = train.training_callbacks(
+                {'patience': 2, 'warmup_epochs': 3}, directory)
+            for callback in callbacks:
+                callback.set_model(model)
+                callback.set_params({'epochs': 6, 'steps': 1, 'verbose': 0})
+                callback.on_train_begin()
+            # Global best precedes warmup. Early stopping must not replace it
+            # with the best *post-warmup* checkpoint or stop during warmup.
+            losses = [0.1, 0.9, 0.8, 0.7, 0.75, 0.8]
+            for epoch, value in enumerate(losses):
+                model.set_weights([np.array([[epoch]], dtype='float32')])
+                for callback in callbacks:
+                    callback.on_epoch_end(epoch, {'loss': value, 'val_loss': value})
+                if epoch < 5:
+                    self.assertFalse(model.stop_training)
+            self.assertTrue(model.stop_training)
+            for callback in callbacks:
+                callback.on_train_end()
+            self.assertEqual(checkpoint.best_epoch, 1)
+            self.assertEqual(checkpoint.best_loss, 0.1)
+            np.testing.assert_array_equal(model.get_weights()[0], [[0.]])
+
     def test_actual_fit_reshuffles_and_reproduces(self):
         def record():
             tf.keras.backend.clear_session()

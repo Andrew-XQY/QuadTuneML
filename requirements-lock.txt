@@ -16,6 +16,7 @@ idna==3.19
 joblib==1.6.0
 keras==3.15.1
 kiwisolver==1.5.1
+kneed==0.8.6
 libclang==18.1.1
 Markdown==3.10.3
 markdown-it-py==4.2.0

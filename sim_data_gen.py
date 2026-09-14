@@ -6,6 +6,7 @@ Native MAD-X TRACK supports this lattice's MATRIX elements and thick quadrupoles
 Neither backend configures space charge. PTC is selectable, but rejects MATRIX.
 """
 import argparse
+import ast
 import csv
 import hashlib
 import importlib.metadata
@@ -29,6 +30,123 @@ REPO_ROOT = Path(__file__).resolve().parent
 OUTPUT_KEYS = ["mean_x", "mean_y", "sigma_x", "sigma_y", "emittance_x",
                "emittance_y", "transmission"]
 _WORKER = {}
+PHYSICS_FUNCTIONS = ["build_quad_sobol_queue", "delta_to_pt", "pt_to_delta", "rms_emittance",
+    "generate_particles", "write_inrays", "parse_trackone_to_df", "calculate_beam_parameters",
+    "lattice_files", "snapshot_sources", "build_runner", "_initialize_worker", "run_single"]
+# The verified 5,000-row pilot predates the separate physics fingerprint.
+LEGACY_GENERATOR_SHA256 = "abf037130fab2f11b7832b9db509617ee6204c199a47e4dc4db01c2f916abb5a"
+LEGACY_PHYSICS_SHA256 = "480d5e1e891f9f0739a266da13e431f3ed5717708b25c2fcf5dcfd00fc375b7d"
+
+
+def file_sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def physics_implementation_sha256():
+    """Fingerprint simulation/sampling functions independently of batch I/O."""
+    tree = ast.parse(Path(__file__).read_text())
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    payload = "\n".join(ast.dump(functions[name], include_attributes=False) for name in PHYSICS_FUNCTIONS)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def diagnostic_columns(settings):
+    return list(settings) + ["status", "seconds", "realized_sigma_delta", "realized_mean_delta",
+        "realized_sigma_pt", "beta0", "realized_alfx", "realized_gemx", "realized_alfy",
+        "realized_gemy", "p0_gev_c", "tracked_initial_sigma_delta", "final_particles",
+        "final_centered_emittance_x", "final_centered_emittance_y", "actual_segment_names",
+        "lost_particles", "nonfinite_lost_particles", "finite_lost_particles", "loss_locations",
+        "nonfinite_rows", "nonfinite_segments", "madx_version", "error"]
+
+
+def validate_extension(config, previous_dir, queue):
+    """Validate a complete deterministic prefix before reusing any records.
+
+    Old CSVs did not have contemporaneous checksums. Their schema, inputs,
+    diagnostics and provenance are checked, then their present hashes are saved.
+    """
+    from cpymad.madx import Madx
+    previous_dir = Path(previous_dir).resolve()
+    metadata_path = previous_dir / "metadata.json"
+    previous = json.loads(metadata_path.read_text())
+    count = previous.get("requested", 0)
+    if previous.get("status") != "complete" or previous.get("failed") != 0 or previous.get("completed") != count or not 0 < count < len(queue):
+        raise ValueError("Reuse requires a complete, failure-free, shorter simulation prefix")
+    if previous.get("sampling", "sobol") != "sobol":
+        raise ValueError("Only a deterministic Sobol prefix can be extended")
+    old_config = previous["configuration"]
+    keys = ("particles", "seed", "backend", "quad_keys", "quad_range", "alpha_fraction",
+            "sigma_delta_range", "beam", "observations", "expected_segments",
+            "lattice_root", "external_runner", "initial_conditions")
+    changed = [key for key in keys if old_config.get(key) != config.get(key)]
+    if changed:
+        raise ValueError("Simulation configuration changed: " + ", ".join(changed))
+    fingerprint = physics_implementation_sha256()
+    prior_fingerprint = previous.get("physics_implementation_sha256")
+    if prior_fingerprint is None:
+        if previous.get("generator_sha256") != LEGACY_GENERATOR_SHA256 or fingerprint != LEGACY_PHYSICS_SHA256:
+            raise ValueError("Unrecognized legacy simulator or changed simulation implementation")
+    elif prior_fingerprint != fingerprint:
+        raise ValueError("Simulation implementation changed")
+    expected_sources = [Path(config["lattice_root"]) / name for name in lattice_files()]
+    expected_sources += [Path(config[key]) for key in ("external_runner", "initial_conditions")]
+    if set(previous["source_sha256"]) != {str(path) for path in expected_sources}:
+        raise ValueError("Source-file provenance differs")
+    for source in expected_sources:
+        if file_sha256(source) != previous["source_sha256"][str(source)]:
+            raise ValueError("External simulation source changed: " + str(source))
+    template_hash = hashlib.sha256(build_runner(config, queue[0]).encode()).hexdigest()
+    if template_hash != previous["runner_template_sha256"] or file_sha256(previous_dir / "runner_template.madx") != template_hash:
+        raise ValueError("Generated MAD-X runner differs from previous run")
+    for name, version in previous["package_versions"].items():
+        if importlib.metadata.version(name) != version:
+            raise ValueError("Runtime package changed: " + name)
+    with Madx(stdout=False) as madx:
+        if str(madx.version) != previous["madx_version"]:
+            raise ValueError("MAD-X version changed")
+    data_path = previous_dir / Path(old_config["output"]).name
+    diagnostics_path = previous_dir / "diagnostics.csv"
+    for key, path in (("data_sha256", data_path), ("diagnostics_sha256", diagnostics_path)):
+        if previous.get(key) and file_sha256(path) != previous[key]:
+            raise ValueError("Prior CSV checksum no longer matches its metadata: " + str(path))
+        if not path.read_bytes().endswith(b"\n"):
+            raise ValueError("Prior CSV must end with a complete newline-terminated record")
+    data = pd.read_csv(data_path, float_precision="round_trip")
+    diagnostics = pd.read_csv(diagnostics_path, float_precision="round_trip", keep_default_na=False)
+    if len(data) != count or len(diagnostics) != count:
+        raise ValueError("Prior CSV row counts disagree with metadata")
+    if list(data.columns) != list(queue[0]) + OUTPUT_KEYS or list(diagnostics.columns) != diagnostic_columns(queue[0]):
+        raise ValueError("Prior CSV schema differs")
+    expected = pd.DataFrame(queue[:count])
+    for label, frame in (("data", data), ("diagnostics", diagnostics)):
+        if not np.array_equal(frame[expected.columns].to_numpy(), expected.to_numpy()):
+            raise ValueError("Prior {} is not the exact deterministic Sobol prefix".format(label))
+    if not (diagnostics.status == "ok").all() or not (diagnostics.nonfinite_rows == 0).all():
+        raise ValueError("Prior diagnostics contain failed or nonfinite simulations")
+    if not (diagnostics.final_particles + diagnostics.lost_particles == config["particles"]).all():
+        raise ValueError("Prior particle-loss accounting is inconsistent")
+    if not (diagnostics.finite_lost_particles + diagnostics.nonfinite_lost_particles == diagnostics.lost_particles).all():
+        raise ValueError("Prior numerical-loss classifications are inconsistent")
+    if not (diagnostics.madx_version == previous["madx_version"]).all():
+        raise ValueError("Prior diagnostics contain mixed MAD-X versions")
+    for key in OUTPUT_KEYS:
+        values = np.asarray([ast.literal_eval(value) for value in data[key]], dtype=float)
+        if values.shape != (count, 8) or not np.isfinite(values).all():
+            raise ValueError("Invalid prior eight-segment output: " + key)
+        if key.startswith("emittance_") and not (values > 0).all():
+            raise ValueError("Invalid prior emittance values")
+        if key == "transmission":
+            if not ((values >= 0) & (values <= 1)).all() or not np.allclose(values[:, -1], diagnostics.final_particles/config["particles"], rtol=0, atol=1e-15):
+                raise ValueError("Prior transmission disagrees with surviving particle counts")
+    if (previous_dir / "failures.jsonl").read_text().strip():
+        raise ValueError("Prior failure log is not empty")
+    return dict(directory=str(previous_dir), count=count, data_path=str(data_path),
+                diagnostics_path=str(diagnostics_path), metadata_path=str(metadata_path),
+                data_sha256=file_sha256(data_path), diagnostics_sha256=file_sha256(diagnostics_path),
+                metadata_sha256=file_sha256(metadata_path), prior_generator_sha256=previous["generator_sha256"],
+                physics_implementation_sha256=fingerprint, madx_version=previous["madx_version"],
+                actual_segment_names=previous["actual_segment_names"],
+                validation="Exact Sobol inputs, unchanged simulation functions/config/sources/runtime, complete data and particle-loss accounting")
 
 
 def load_config(path):
@@ -345,7 +463,14 @@ def run_single(settings):
         return None, stats
 
 
-def run_batch(config, repo_root=REPO_ROOT):
+def run_batch(config, repo_root=REPO_ROOT, extend_from=None, queue=None, metadata_extra=None):
+    custom_queue = queue is not None
+    queue = build_quad_sobol_queue(config, config["samples"]) if queue is None else queue
+    if not queue:
+        raise ValueError("Simulation queue is empty")
+    if custom_queue and extend_from:
+        raise ValueError("Custom repeated-simulation queues cannot extend a Sobol run")
+    reuse = validate_extension(config, extend_from, queue) if extend_from else None
     output = Path(config["output"])
     output = (Path(repo_root) / output).resolve() if not output.is_absolute() else output.resolve()
     results_root = (Path(repo_root) / "results").resolve()
@@ -358,10 +483,11 @@ def run_batch(config, repo_root=REPO_ROOT):
     if config["particles"] < 3 or config["workers"] < 1:
         raise ValueError("Require particles >= 3 and workers >= 1")
     snapshot, hashes = snapshot_sources(config, output_dir)
-    queue = build_quad_sobol_queue(config, config["samples"])
     (output_dir / "runner_template.madx").write_text(build_runner(config, queue[0]))
     (output_dir / "simulation_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
     metadata = dict(status="running", configuration=config, source_sha256=hashes,
+                    physics_implementation_sha256=physics_implementation_sha256(),
+                    sampling="custom" if custom_queue else "sobol",
                     generator_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     runner_template_sha256=hashlib.sha256((output_dir / "runner_template.madx").read_bytes()).hexdigest(),
                     python=sys.version, executable=sys.executable,
@@ -380,24 +506,35 @@ def run_batch(config, repo_root=REPO_ROOT):
                     dispersion_convention="entrance coordinates += [DX,DPX,DY,DPY]_PT * PT",
                     note="Provisional beam/ranges; independent measured-beam calibration not performed.",
                     completed=0, failed=0, requested=len(queue), started_unix=time.time())
+    if set(metadata_extra or {}).intersection(metadata):
+        raise ValueError("Custom study metadata must not override simulation provenance")
+    metadata.update(metadata_extra or {})
+    if reuse:
+        metadata.update(reuse= reuse, completed=reuse["count"], reused=reuse["count"],
+                        generated_this_run=0, actual_segment_names=reuse["actual_segment_names"],
+                        madx_version=reuse["madx_version"])
+        shutil.copy2(reuse["data_path"], str(output))
+        shutil.copy2(reuse["diagnostics_path"], str(output_dir / "diagnostics.csv"))
+        shutil.copy2(reuse["metadata_path"], str(output_dir / "reuse_source_metadata.json"))
+        pending = queue[reuse["count"]:]
+    else:
+        metadata.update(reused=0, generated_this_run=0)
+        pending = queue
     metadata_path = output_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2))
     started = time.monotonic()
-    diag_keys = list(queue[0]) + ["status", "seconds", "realized_sigma_delta", "realized_mean_delta",
-        "realized_sigma_pt", "beta0", "realized_alfx", "realized_gemx", "realized_alfy",
-        "realized_gemy", "p0_gev_c", "tracked_initial_sigma_delta", "final_particles",
-        "final_centered_emittance_x", "final_centered_emittance_y", "actual_segment_names",
-        "lost_particles", "nonfinite_lost_particles", "finite_lost_particles", "loss_locations",
-        "nonfinite_rows", "nonfinite_segments", "madx_version", "error"]
-    with open(output, "w", newline="") as data_stream, open(output_dir / "diagnostics.csv", "w", newline="") as diag_stream, open(output_dir / "failures.jsonl", "w") as failures:
+    diag_keys = diagnostic_columns(queue[0])
+    mode = "a" if reuse else "w"
+    with open(output, mode, newline="") as data_stream, open(output_dir / "diagnostics.csv", mode, newline="") as diag_stream, open(output_dir / "failures.jsonl", "w") as failures:
         data_writer = csv.DictWriter(data_stream, fieldnames=list(queue[0])+OUTPUT_KEYS)
         diag_writer = csv.DictWriter(diag_stream, fieldnames=diag_keys)
-        data_writer.writeheader()
-        diag_writer.writeheader()
+        if not reuse:
+            data_writer.writeheader()
+            diag_writer.writeheader()
         context = mp.get_context("spawn")
         with context.Pool(config["workers"], initializer=_initialize_worker,
                           initargs=(config, str(snapshot), str(output_dir))) as pool:
-            for row, stats in pool.imap(run_single, queue, chunksize=1):
+            for row, stats in pool.imap(run_single, pending, chunksize=1):
                 diag_writer.writerow(stats)
                 if row is None:
                     metadata["failed"] += 1
@@ -406,6 +543,7 @@ def run_batch(config, repo_root=REPO_ROOT):
                 else:
                     data_writer.writerow(row)
                     metadata["completed"] += 1
+                    metadata["generated_this_run"] += 1
                     if "actual_segment_names" not in metadata:
                         metadata["actual_segment_names"] = json.loads(stats["actual_segment_names"])
                         metadata["madx_version"] = stats["madx_version"]
@@ -419,6 +557,8 @@ def run_batch(config, repo_root=REPO_ROOT):
                         done, len(queue), metadata["failed"], metadata["elapsed_seconds"]), flush=True)
     metadata.update(status="complete" if not metadata["failed"] else "complete_with_failures",
                     elapsed_seconds=time.monotonic()-started, finished_unix=time.time())
+    metadata["data_sha256"] = file_sha256(output)
+    metadata["diagnostics_sha256"] = file_sha256(output_dir / "diagnostics.csv")
     metadata_path.write_text(json.dumps(metadata, indent=2))
     return metadata
 
@@ -430,13 +570,15 @@ def main():
         parser.add_argument("--" + key, type=int)
     parser.add_argument("--output", help="CSV path inside this repository's results/")
     parser.add_argument("--backend", choices=("madx", "ptc"))
+    parser.add_argument("--extend-from", type=Path,
+                        help="Reuse a verified complete Sobol prefix from this prior run directory")
     args = parser.parse_args()
     config = load_config(args.config)
     for key in ("samples", "particles", "seed", "workers", "output", "backend"):
         value = getattr(args, key)
         if value is not None:
             config[key] = value
-    metadata = run_batch(config)
+    metadata = run_batch(config, extend_from=args.extend_from)
     return 1 if metadata["failed"] else 0
 
 

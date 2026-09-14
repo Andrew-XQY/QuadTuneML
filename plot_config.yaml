@@ -1,0 +1,12 @@
+# One font multiplier per figure scales labels, ticks, legend, math and annotations.
+# Dimensions are inches. CLI --font-scale overrides the selected figure(s).
+parity:
+  font_scale: 1.5
+  figsize: [10.0, 4.7]
+  wspace: 0.16
+  marker_size: 7
+
+efficiency:
+  font_scale: 1.3
+  figsize: [11.2, 4.5]
+  wspace: 0.18

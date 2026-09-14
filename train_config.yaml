@@ -1,5 +1,5 @@
 # Standalone seven-input training; config.yaml remains the historical notebook config.
-# Run: python train.py --data results/pilot_20260907/data.csv --output-dir results/pilot_20260907/training
+# Run: python train.py --data results/experiment_20260908_12000/data.csv --output-dir results/experiment_20260908_12000/training
 input_cols:
   - klne.zqmd.0208
   - klne.zqmf.0209
@@ -20,6 +20,9 @@ test_size: 0.1
 val_size: 0.1
 batch_size: 32
 learning_rate: 1.0e-4
-epochs: 100
-seed: 42
-patience: 5
+epochs: 500
+warmup_epochs: 100  # no early-stop monitoring during startup; best checkpoint includes every epoch
+patience: 50
+seed: 42  # predeclared main model seed, not selected from test performance
+split_seed: 42  # fixed holdouts and nested training-subset order across model seeds
+repeat_seeds: [42, 43, 44]  # initialization + epoch-shuffle variation at each sample count
